@@ -42,11 +42,36 @@ func (s *SftpHandler) RealPath(p string) (string, error) {
 	return clean, nil
 }
 
+// clientPathToVirtual maps the displayed direct-connection path back to the
+// virtual namespace used by the dev branch's SFTP implementation.
+func (s *SftpHandler) clientPathToVirtual(p string) (string, error) {
+	root, err := s.InitDirectSFTPRoot()
+	if err != nil || root == "" {
+		return p, err
+	}
+	root = path.Clean(root)
+	clean := path.Clean("/" + p)
+	if clean == "/" || clean == root {
+		return "/", nil
+	}
+	if root == "/" {
+		return clean, nil
+	}
+	if !strings.HasPrefix(clean, root+"/") {
+		return "", sftp.ErrSshFxPermissionDenied
+	}
+	return strings.TrimPrefix(clean, root), nil
+}
+
 func (s *SftpHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
+	virtualPath, err := s.clientPathToVirtual(r.Filepath)
+	if err != nil {
+		return nil, err
+	}
 	switch r.Method {
 	case "List":
 		logger.Debug("List method: ", r.Filepath)
-		res, err := s.ReadDir(r.Filepath)
+		res, err := s.ReadDir(virtualPath)
 		fileInfos := make(listerat, 0, len(res))
 		for i := 0; i < len(res); i++ {
 			fileInfos = append(fileInfos, &wrapperSFTPFileInfo{f: res[i]})
@@ -54,11 +79,11 @@ func (s *SftpHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 		return fileInfos, err
 	case "Stat":
 		logger.Debug("stat method: ", r.Filepath)
-		fsInfo, err := s.Stat(r.Filepath)
+		fsInfo, err := s.Stat(virtualPath)
 		return listerat([]os.FileInfo{fsInfo}), err
 	case "Readlink":
 		logger.Debug("Readlink method", r.Filepath)
-		filename, err := s.ReadLink(r.Filepath)
+		filename, err := s.ReadLink(virtualPath)
 		fsInfo := srvconn.NewFakeSymFile(filename)
 		return listerat([]os.FileInfo{&wrapperSFTPFileInfo{f: fsInfo}}), err
 	}
@@ -67,25 +92,37 @@ func (s *SftpHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 
 func (s *SftpHandler) Filecmd(r *sftp.Request) (err error) {
 	logger.Debug("File cmd: ", r.Filepath)
+	virtualPath, err := s.clientPathToVirtual(r.Filepath)
+	if err != nil {
+		return err
+	}
 
 	switch r.Method {
 	case "Setstat":
 		return
 	case "Rename":
 		logger.Debugf("%s=>%s", r.Filepath, r.Target)
-		return s.Rename(r.Filepath, r.Target)
+		target, err := s.clientPathToVirtual(r.Target)
+		if err != nil {
+			return err
+		}
+		return s.Rename(virtualPath, target)
 	case "Rmdir":
 		logger.Debug("Remove directory: ", r.Filepath)
-		err = s.RemoveDirectory(r.Filepath)
+		err = s.RemoveDirectory(virtualPath)
 	case "Remove":
 		logger.Debug("Remove: ", r.Filepath)
-		err = s.Remove(r.Filepath)
+		err = s.Remove(virtualPath)
 	case "Mkdir":
 		logger.Debug("Mkdir: ", r.Filepath)
-		err = s.MkdirAll(r.Filepath)
+		err = s.MkdirAll(virtualPath)
 	case "Symlink":
 		logger.Debugf("%s=>%s", r.Filepath, r.Target)
-		err = s.Symlink(r.Filepath, r.Target)
+		target, err := s.clientPathToVirtual(r.Target)
+		if err != nil {
+			return err
+		}
+		return s.Symlink(virtualPath, target)
 	default:
 		logger.Debug("Unsupported method: ", r.Method)
 		return
@@ -95,7 +132,11 @@ func (s *SftpHandler) Filecmd(r *sftp.Request) (err error) {
 
 func (s *SftpHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	logger.Debug("File write: ", r.Filepath)
-	f, err := s.Create(r.Filepath)
+	virtualPath, err := s.clientPathToVirtual(r.Filepath)
+	if err != nil {
+		return nil, err
+	}
+	f, err := s.Create(virtualPath)
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +165,11 @@ func (s *SftpHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 
 func (s *SftpHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	logger.Debug("File read: ", r.Filepath)
-	f, err := s.Open(r.Filepath)
+	virtualPath, err := s.clientPathToVirtual(r.Filepath)
+	if err != nil {
+		return nil, err
+	}
+	f, err := s.Open(virtualPath)
 	if err != nil {
 		return nil, err
 	}
